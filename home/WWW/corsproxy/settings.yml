@@ -1,0 +1,11 @@
+logger: !!null   
+whitelists:
+    user_ip:
+    - "^.*$"
+    target_url:
+    - '^.*$'
+    post:
+    - '^.*$'
+    get:
+    - '^.*$'
+
