@@ -1,0 +1,157 @@
+user  nginx;
+worker_processes 1;
+error_log  /var/log/nginx/error.log  warn;
+ 
+events {
+    worker_connections 1024;
+    use epoll;
+}
+ 
+http {
+    include mime.types;
+    default_type application/octet-stream; 
+    log_format main '$remote_addr - $remote_user [$time_local] '
+                  '"$request" $status $body_bytes_sent "$http_referer" '
+                  '"$http_user_agent" "$http_x_forwarded_for"';
+    server_tokens off; 
+    server_names_hash_max_size    64;
+    server_names_hash_bucket_size 64;
+   
+    sendfile off; 
+    tcp_nodelay     on;
+    tcp_nopush on;
+    gzip            off;
+    charset utf-8;
+
+    lua_package_path "/usr/local/lib/lua/?.lua;/usr/local/lib/lua/5.1/?.lua;;";
+
+    limit_req_zone $binary_remote_addr zone=CorsProxyZone:10m rate=${REQ_MAX}r/s;
+
+    server{   
+        listen 8080;
+        server_name              ${DOMAIN};
+        set $_SETTINGS_PATH      /opt/conf/settings.yml;
+        set $_HTML_ROOT          /opt/html/;   
+        resolver ${DNS} valid=300s;
+        resolver_timeout         1s;
+        error_page               403 = /403.html;
+        add_header X-Frame-Options DENY always;
+        add_header X-Content-Type-Options nosniff always;    
+        underscores_in_headers on;
+
+        location / {
+            root $_HTML_ROOT;
+            index index.html index.htm index.txt;
+        }
+
+        location ~^/(https?[:!]\/?\/?.+)$ {
+            limit_rate ${SPEED_LIMIT};
+            client_max_body_size 1m;
+            limit_req zone=CorsProxyZone burst=${REQ_BURST};
+
+            default_type "text/html";        
+            set $target_proto "";
+            set $target_url "";
+            set $target_host "";
+            rewrite_by_lua  '
+                local _SETTINGS_PATH=ngx.var._SETTINGS_PATH
+                local Regex=require "rex_posix"
+                local Yaml=require "yaml"
+                local settings_io = io.open(_SETTINGS_PATH, "rb")
+                local SETTINGS=Yaml.load(settings_io:read("*all"))
+                settings_io:close();
+
+                ngx.req.read_body()
+                local GET, err_get = ngx.req.get_uri_args()
+                local POST, err_post = ngx.req.get_post_args()  
+                local IP = ngx.var.remote_addr
+                local scheme,turl = Regex.match(ngx.var.uri,"^\\\\/(https?)[!:]\\\\/?\\\\/?([^$]+)")
+
+                if scheme==nil or turl==nil then ngx.exit(ngx.HTTP_FORBIDDEN) end
+
+                local TARGET_URL=scheme.."://"..turl
+
+                function isInWhitelist(things,whitelist_name,nokey)
+                    local whitelist = SETTINGS["whitelists"][whitelist_name]
+                    for k,v in pairs(things) do
+                    local entry=nil;       
+                    if nokey then
+                        entry=tostring(v)
+                    else
+                        entry=tostring(k).."="..tostring(v)
+                    end   
+                    
+                    local found=false
+                    for k,whitelist_entry in pairs(whitelist) do
+                        if Regex.match(entry, whitelist_entry)~=nil then
+                            found=true
+                            break
+                            end            
+                        end        
+                        if not found then
+                            return false
+                        end
+                    end
+                    return true
+                end
+
+                local success=true
+                if not isInWhitelist({IP},"user_ip",true) or not isInWhitelist({TARGET_URL},"target_url",true) or not isInWhitelist(POST,"post",false) or not isInWhitelist(GET,"get",false) then
+                    success=false
+                end
+
+                if SETTINGS["logger"] ~= nil and SETTINGS["logger"]~="" then
+                    local logger = assert (loadfile (SETTINGS["logger"]))   
+                    logger()
+                    log(success,GET,POST,IP,TARGET_URL)    
+                end
+
+                if not success then ngx.exit(ngx.HTTP_FORBIDDEN) end
+                ngx.var.target_url = TARGET_URL
+                ngx.var.target_host = Regex.match(TARGET_URL,"^https?:\\\\/\\\\/([^/$]+)")
+                ngx.var.target_proto=scheme
+            ';
+    
+        
+            proxy_set_header            "Host" $target_host;
+            proxy_set_header            "Cookie" "";
+            proxy_set_header            "X-Forwarded-Proto" $scheme;
+            proxy_set_header            "X-Forwarded-For" $proxy_add_x_forwarded_for;
+            proxy_set_header            "X-Real-IP" $remote_addr;
+            proxy_connect_timeout       10;
+            proxy_send_timeout          30;
+            proxy_read_timeout          30;        
+            proxy_pass                  $target_url$is_args$args;
+            proxy_ssl_session_reuse     off;
+            proxy_ssl_ciphers           "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH";
+            proxy_ssl_protocols         TLSv1 TLSv1.1 TLSv1.2;
+            proxy_cookie_domain         off;
+            proxy_redirect              $target_proto://$target_host/ $scheme://$server_name:$server_port/$target_proto!$target_host/;
+            proxy_intercept_errors      off;
+            
+            #From http://enable-cors.org/server_nginx.html
+            if ($request_method = 'OPTIONS') {
+                add_header 'Access-Control-Allow-Origin' '*' always;
+                add_header 'Access-Control-Allow-Credentials' 'true' always;
+                add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+                add_header 'Access-Control-Allow-Headers' 'Accept-Encoding,DNT,X-CustomHeader,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type' always;
+                add_header 'Access-Control-Max-Age' 1728000 always;
+                add_header 'Content-Type' 'text/plain charset=UTF-8' always;
+                add_header 'Content-Length' 0 always;
+                return 204;
+            }
+            if ($request_method = 'POST') {
+                add_header 'Access-Control-Allow-Origin' '*' always;
+                add_header 'Access-Control-Allow-Credentials' 'true' always;
+                add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+                add_header 'Access-Control-Allow-Headers' 'Accept-Encoding,DNT,X-CustomHeader,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type' always;
+            }
+            if ($request_method = 'GET') {
+                add_header 'Access-Control-Allow-Origin' '*' always;
+                add_header 'Access-Control-Allow-Credentials' 'true' always;
+                add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+                add_header 'Access-Control-Allow-Headers' 'Accept-Encoding,DNT,X-CustomHeader,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type' always;
+            }
+        }
+    }
+}
